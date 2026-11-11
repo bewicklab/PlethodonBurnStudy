@@ -1,0 +1,167 @@
+# QIIME 2 amplicon analysis workflow
+# This document cleans up the original analysis notes for QIIME 2 2024.2 on Clemson's Palmetto cluster
+# . It records commands and alternative test settings; it is **not a claim that every alternative was 
+# used in the final analysis**. Confirm the settings and reference files against the actual run or QII
+# ME 2 artifact provenance before using this as the published methods record.
+# Before running
+# - Replace `PATH_TO_SEQUENCES` with the directory containing the demultiplexed paired-end FASTQ files
+# . The original import uses QIIME 2's `CasavaOneEightLanelessPerSampleDirFmt`; filenames must meet th
+# at format.
+# - Place `metadata.tsv` and `silva-138-99-nb-classifier.qza` in the working directory, or change thei
+# r paths. The SEPP alternative also requires `sepp-refs-gg-13-8.qza`.
+# - Run in a working directory with sufficient storage. Avoid overwriting outputs from different runs:
+#  use separate directories and keep original artifacts for provenance.
+# - The SILVA classifier and SEPP reference database were identified by filename in the notes; record 
+# their exact source, version, training region and preparation details separately. SILVA is used for t
+# axonomy and Greengenes for the SEPP tree.
+# - Commands below are meant to be run in order, **one section at a time**. Select only one DADA2 opti
+# on and one tree method per run. The alternatives have different outputs and are not interchangeable 
+# without recording the choice.
+# 1. Start a session and activate QIIME 2
+# Example interactive allocation from the original notes; adapt resources and scheduling settings to y
+# our cluster and its current limits:
+salloc --cpus-per-task=192 --mem=750GB --time=48:00:00
+module load qiime2/2024.2
+source /project/cugbf/software/gbf/qiime/qiime2024.2.sh
+qiime info
+
+# The module and activation path are specific to Palmetto. On another system, activate a QIIME 2 2024.
+# 2 environment using that system's instructions. Exit the environment with `conda deactivate`.
+# 2. Import and inspect reads
+qiime tools import \
+  --type 'SampleData[PairedEndSequencesWithQuality]' \
+  --input-path PATH_TO_SEQUENCES \
+  --input-format CasavaOneEightLanelessPerSampleDirFmt \
+  --output-path demux-paired-end.qza
+
+qiime demux summarize \
+  --i-data demux-paired-end.qza \
+  --o-visualization demux-paired-end.qzv
+
+# Inspect the quality profiles in `demux-paired-end.qzv` before deciding on trimming and truncation. T
+# he notes do not establish which parameter set was used for the final dataset or document primer remo
+# val; verify both in the original records.
+# 3. Denoise paired reads with DADA2
+# Choose **one** option in a fresh run directory. Both produce the same filenames. The original comman
+# ds used the default thread setting unless `--p-n-threads 0` was explicitly specified in a later trou
+# bleshooting job.
+# Option A: Original full-data command (250 bp forward, 250 bp reverse)
+qiime dada2 denoise-paired \
+  --i-demultiplexed-seqs demux-paired-end.qza \
+  --p-trim-left-f 0 \
+  --p-trunc-len-f 250 \
+  --p-trunc-len-r 250 \
+  --o-representative-sequences rep-seqs-dada2.qza \
+  --o-table table-dada2.qza \
+  --o-denoising-stats stats-dada2.qza
+
+# Option B: Test-batch command (280 bp forward, 230 bp reverse)
+qiime dada2 denoise-paired \
+  --i-demultiplexed-seqs demux-paired-end.qza \
+  --p-trim-left-f 0 \
+  --p-trim-left-r 0 \
+  --p-trunc-len-f 280 \
+  --p-trunc-len-r 230 \
+  --o-representative-sequences rep-seqs-dada2.qza \
+  --o-table table-dada2.qza \
+  --o-denoising-stats stats-dada2.qza
+
+# The later troubleshooting version of Option B also included `--p-n-threads 0`. Check QIIME 2's help 
+# and cluster allocation before using this setting; record the actual setting used. After denoising, p
+# repare summaries and the filenames used below:
+mv stats-dada2.qza demux-filter-stats.qza
+qiime metadata tabulate \
+  --m-input-file demux-filter-stats.qza \
+  --o-visualization demux-filter-stats.qzv
+mv rep-seqs-dada2.qza rep-seqs.qza
+mv table-dada2.qza table.qza
+
+qiime feature-table summarize \
+  --i-table table.qza \
+  --o-visualization table.qzv \
+  --m-sample-metadata-file metadata.tsv
+qiime feature-table tabulate-seqs \
+  --i-data rep-seqs.qza \
+  --o-visualization rep-seqs.qzv
+
+# 4. Build a phylogenetic tree
+# Option A: MAFFT and FastTree
+qiime phylogeny align-to-tree-mafft-fasttree \
+  --i-sequences rep-seqs.qza \
+  --o-alignment aligned-rep-seqs.qza \
+  --o-masked-alignment masked-aligned-rep-seqs.qza \
+  --o-tree unrooted-tree.qza \
+  --o-rooted-tree rooted-tree.qza
+qiime tools export --input-path rooted-tree.qza --output-path exported_tree
+
+# Option B: SEPP fragment insertion
+# The notes describe this as an alternative when the MAFFT approach could not handle the dataset. It u
+# ses a Greengenes 13_8 reference package and produces an insertion tree and placements, not the same 
+# outputs as Option A.
+qiime fragment-insertion sepp \
+  --i-representative-sequences rep-seqs.qza \
+  --i-reference-database sepp-refs-gg-13-8.qza \
+  --o-tree insertion-tree.qza \
+  --o-placements insertion-placements.qza \
+  --p-threads 16
+qiime tools export --input-path insertion-tree.qza --output-path exported_tree
+
+# Exported tree files can be used in R. The diversity command in Section 6 uses the MAFFT output `root
+# ed-tree.qza`, as in the original notes. If SEPP was actually used, change that input to `insertion-t
+# ree.qza` and verify compatibility and feature coverage; document the actual method used.
+# 5. Assign taxonomy and create visualizations
+qiime feature-classifier classify-sklearn \
+  --i-classifier silva-138-99-nb-classifier.qza \
+  --i-reads rep-seqs.qza \
+  --o-classification taxonomy.qza
+qiime metadata tabulate \
+  --m-input-file taxonomy.qza \
+  --o-visualization taxonomy.qzv
+qiime tools export --input-path taxonomy.qza --output-path exported_taxonomy
+qiime taxa barplot \
+  --i-table table.qza \
+  --i-taxonomy taxonomy.qza \
+  --m-metadata-file metadata.tsv \
+  --o-visualization taxa-bar-plots.qzv
+
+# 6. Alpha and beta diversity
+# The original sampling depth was 9,000 sequences per sample. Confirm this is the depth used in the fi
+# nal analysis and examine sample retention in `table.qzv`. This step performs rarefaction; record the
+#  actual random-seed settings and software version where relevant.
+qiime diversity core-metrics-phylogenetic \
+  --i-phylogeny rooted-tree.qza \
+  --i-table table.qza \
+  --p-sampling-depth 9000 \
+  --m-metadata-file metadata.tsv \
+  --output-dir core-metrics-results
+
+# 7. Export ASV and genus-level tables for R
+qiime tools export --input-path table.qza --output-path exported_asv
+qiime taxa collapse \
+  --i-table table.qza \
+  --i-taxonomy taxonomy.qza \
+  --p-level 6 \
+  --o-collapsed-table genus.qza
+qiime tools export --input-path genus.qza --output-path exported_genus
+biom convert \
+  -i exported_genus/feature-table.biom \
+  -o genus.tsv \
+  --to-tsv \
+  --header-key taxonomy
+biom convert \
+  -i exported_asv/feature-table.biom \
+  -o ASV.tsv \
+  --to-tsv
+
+# Check that level 6 corresponds to genus for the taxonomy strings in the selected classifier. Inspect
+#  the exported BIOM files and TSV headers; taxonomy metadata may not be present in every exported tab
+# le, so `--header-key taxonomy` may require adjustment. Preserve taxonomy separately in `exported_tax
+# onomy`.
+# Notes on Slurm jobs
+# The original notes included separate test jobs for DADA2 (192 CPUs / 1,500 GB / 72 hours, and a trou
+# bleshooting job with 128 CPUs / 740 GB / 24 hours), MAFFT/FastTree (16 CPUs / 64 GB / 72 hours), and
+#  SEPP (16 CPUs / 128 GB / 72 hours). These are historical resource requests, not validated recommend
+# ations. A CPU allocation alone does not necessarily cause a tool to use all CPUs. The troubleshootin
+# g DADA2 run specified `--p-n-threads 0`; the SEPP run specified 16 threads. Consult current cluster 
+# limits and QIIME 2 command help, and record the actual job scripts and parameters used in the final 
+# analysis.
